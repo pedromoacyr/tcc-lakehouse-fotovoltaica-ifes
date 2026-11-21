@@ -43,7 +43,7 @@ Os notebooks 01 a 10 formam o pipeline. Os notebooks 11 a 14 executam a avaliaç
 
 ## Como executar
 
-1. Crie no Unity Catalog o catálogo `fotovoltaica_ifes`, com os esquemas `bronze`, `silver` e `gold`, e o volume `bronze.landing_usina`.
+1. Crie no Unity Catalog o catálogo `fotovoltaica_ifes`, com os esquemas `bronze`, `silver`, `gold` e `teste_parecer` (este último usado só pelos notebooks 12 e 13), e os volumes `bronze.landing_usina`, `bronze.landing_incidencia_solar` e `gold.graficos_tcc`.
 2. Deposite o arquivo de medições `medicoes_usina.zip` em `/Volumes/fotovoltaica_ifes/bronze/landing_usina/`.
 3. Importe os notebooks no workspace (*Import* > *File*) e execute-os na ordem acima. O trabalho usou o Databricks Free Edition, com compute serverless.
 
@@ -51,7 +51,7 @@ Os parâmetros da usina (coordenadas, inclinação, azimute e geometria do rastr
 
 ## Dependências
 
-Databricks com Unity Catalog, Delta Lake e Auto Loader, e as bibliotecas Python pvlib, pandas, NumPy e Matplotlib. A avaliação de desempenho também usa DuckDB.
+Databricks com Unity Catalog, Delta Lake e Auto Loader, e as bibliotecas Python pandas, NumPy e Matplotlib. Os notebooks 08 e 14 instalam a pvlib 0.11.2, e o notebook 12 instala o DuckDB 1.1.3.
 
 ## Licença
 
