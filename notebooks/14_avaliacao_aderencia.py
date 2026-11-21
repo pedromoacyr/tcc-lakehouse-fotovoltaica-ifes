@@ -15,7 +15,10 @@
 # MAGIC - **validacao da irradiancia** do NASA POWER contra o INMET A612;
 # MAGIC - **alinhamento sub-horario** em passos de 5 minutos;
 # MAGIC - testes das hipoteses explicativas: *clipping*, temperatura (proxy x NOCT),
-# MAGIC   sujidade (dias desde a ultima chuva) e disponibilidade diurna.
+# MAGIC   sujidade (dias desde a ultima chuva) e disponibilidade diurna;
+# MAGIC - verificacoes complementares citadas no texto (convencao de tempo das
+# MAGIC   series, verificacao das fontes, efeito das decisoes de preparacao,
+# MAGIC   quarentena diurna e noturna, estados do rastreador, PR e Atlas).
 # MAGIC
 # MAGIC Todas as tabelas de saida comecam com `avaliacao_` na gold e alimentam as
 # MAGIC figuras do notebook 10 e os numeros do texto.
@@ -296,6 +299,135 @@ WHERE f.canal = 'A' GROUP BY 1 ORDER BY disponibilidade_diurna DESC
 spark.createDataFrame(disp).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{GOLD}.avaliacao_disponibilidade_diurna")
 display(disp)
 saida["disponibilidade_diurna"] = disp.round(4).to_dict("records")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8) Verificacoes complementares citadas no texto
+# MAGIC Grava em `avaliacao_verificacoes` (grupo, indicador, valor, n, definicao) os
+# MAGIC numeros do texto que nao estao nas tabelas anteriores, cada um com a sua
+# MAGIC definicao: convencao de tempo das series horarias, verificacao preliminar das
+# MAGIC fontes com o canal A, correlacoes entre potencia e irradiacao, efeito das
+# MAGIC decisoes de preparacao sobre a razao, quarentena diurna e noturna, estados do
+# MAGIC rastreador por periodo, razao de desempenho (PR) e coerencia entre o Atlas e a
+# MAGIC climatologia do NASA POWER.
+
+# COMMAND ----------
+
+V = []
+def reg(grupo, indicador, valor, n, definicao):
+    V.append({"grupo": grupo, "indicador": indicador, "valor": float(valor), "n": int(n), "definicao": definicao})
+
+# 8.1 Convencao de tempo: NASA POWER (ceu claro) e INMET (dias claros) contra o ceu claro de Ineichen (pvlib)
+U = spark.table(f"{GOLD}.dim_usina").toPandas().iloc[0]
+ir = spark.table(f"{GOLD}.fato_irradiancia_hora").select("hora_utc", "hora_local", "ghi_ceu_claro_wh_m2", "ghi_inmet_wh_m2").toPandas()
+ir["hora_utc"] = pd.to_datetime(ir.hora_utc, utc=True)
+ir["hora_local"] = pd.to_datetime(ir.hora_local)
+loc = pvlib.location.Location(U.latitude, U.longitude, altitude=U.altitude_m)
+t1 = pd.date_range(ir.hora_utc.min() - pd.Timedelta("3h"), ir.hora_utc.max() + pd.Timedelta("3h"), freq="1min", tz="UTC")
+ineichen = loc.get_clearsky(t1, model="ineichen")["ghi"].resample("1h", label="left", closed="left").mean()  # media em [h, h+1)
+conv = {"inicio": 0, "fim": 1}  # rotulo h = inicio [h, h+1) ou fim [h-1, h) do intervalo
+ns = ir.set_index("hora_utc").ghi_ceu_claro_wh_m2
+for nome, d in conv.items():
+    ref = ineichen.shift(d).reindex(ns.index)
+    ok = ns.notna() & ref.notna() & ((ns > 0) | (ref > 0))
+    reg("convencao_tempo", f"nasa_ceu_claro_rotulo_{nome}_r", np.corrcoef(ns[ok], ref[ok])[0, 1], ok.sum(),
+        f"Correlacao horaria entre a GHI de ceu claro do NASA POWER (UTC) e a media de Ineichen (pvlib) supondo o rotulo como {nome} do intervalo")
+    reg("convencao_tempo", f"nasa_ceu_claro_rotulo_{nome}_rmse_wh", np.sqrt(((ns[ok] - ref[ok]) ** 2).mean()), ok.sum(), "RMSE horario da mesma comparacao (Wh/m2)")
+# INMET: a gold guarda a serie ja rotulada pelo inicio da hora; o rotulo original da estacao e o da gold + 1 h
+inm = ir.set_index("hora_utc").ghi_inmet_wh_m2
+inm_orig = pd.Series(inm.values, index=inm.index + pd.Timedelta("1h"))
+dia_loc = ir.set_index("hora_utc").hora_local.dt.date
+ref0 = ineichen.reindex(inm.index)
+tab = pd.DataFrame({"g": inm, "c": ref0, "dia": dia_loc})
+sol_h = tab[tab.c > 0]
+dd = sol_h.groupby("dia").agg(g=("g", "sum"), c=("c", "sum"), falta=("g", lambda s: s.isna().sum()))
+claros = dd[(dd.falta == 0) & (dd.g >= 0.75 * dd.c)].index
+for nome, d in conv.items():
+    ref = ineichen.shift(d).reindex(inm_orig.index)
+    m = pd.Series(inm_orig.index.tz_convert("America/Sao_Paulo").date, index=inm_orig.index).isin(claros) & inm_orig.notna() & ((inm_orig > 0) | (ref > 0))
+    reg("convencao_tempo", f"inmet_dias_claros_rotulo_original_{nome}_r", np.corrcoef(inm_orig[m], ref[m])[0, 1], len(claros),
+        f"Correlacao horaria entre a radiacao global do INMET A612 com o rotulo original e Ineichen, supondo o rotulo como {nome} do intervalo; n = dias claros (todas as horas com sol com dado e soma diaria >= 75% de Ineichen)")
+
+# 8.2 Verificacao preliminar das fontes: energia do canal A x GHI do NASA POWER, sem exigir horas completas
+pa = spark.sql(f"""SELECT date_trunc('hour', instante_coleta_local) hora_local, sum(potencia_w) * 5 / 60 e_wh, count(*) n
+                   FROM {GOLD}.fato_potencia_5min WHERE canal = 'A' GROUP BY 1""").toPandas()
+pa["hora_local"] = pd.to_datetime(pa.hora_local)
+gh = spark.table(f"{GOLD}.fato_irradiancia_hora").select("hora_local", "ghi_wh_m2").toPandas(); gh["hora_local"] = pd.to_datetime(gh.hora_local)
+zn = spark.table(f"{GOLD}.fato_irradiancia_plano_hora").select("hora_local", "zenite_solar_graus").toPandas(); zn["hora_local"] = pd.to_datetime(zn.hora_local)
+for nome, desl in [("utc-3", 0), ("utc-2", -1), ("utc-4", 1)]:
+    g2 = gh.assign(hora_local=gh.hora_local + pd.Timedelta(hours=desl))
+    x = pa.merge(g2, on="hora_local"); x = x[x.ghi_wh_m2 > 0]
+    reg("verificacao_fontes", f"r_horaria_canal_a_ghi_{nome}", np.corrcoef(x.e_wh, x.ghi_wh_m2)[0, 1], len(x),
+        f"Correlacao horaria entre a energia do canal A dos 4 microinversores (leituras disponiveis, sem exigir hora completa) e a GHI do NASA POWER, horas com GHI > 0, medicoes tratadas como {nome}")
+x = pa.merge(gh, on="hora_local").merge(zn, on="hora_local"); x["dia"] = x.hora_local.dt.date
+pos = zn[zn.zenite_solar_graus < 90].assign(dia=zn.hora_local.dt.date).groupby("dia").size() * 12 * 4
+gd = gh.assign(dia=gh.hora_local.dt.date).groupby("dia").ghi_wh_m2.sum()
+xd = x[x.zenite_solar_graus < 90].groupby("dia").agg(e_wh=("e_wh", "sum"), n=("n", "sum")).join(gd).join(pos.rename("pos"))
+xd = xd[xd.n >= 0.9 * xd.pos]
+reg("verificacao_fontes", "r_diaria_canal_a_ghi", np.corrcoef(xd.e_wh, xd.ghi_wh_m2)[0, 1], len(xd),
+    "Correlacao diaria entre a energia do canal A e a GHI diaria do NASA POWER, dias com pelo menos 90% das leituras diurnas do canal A")
+
+# 8.3 Correlacoes entre potencia total e irradiacao (Secao 4.3.3)
+for k, v in corr.items():
+    if k.startswith("r_potencia"):
+        reg("correlacoes", k, v, 0, "Correlacao horaria entre a potencia total (media das leituras x numero de equipamentos) e a irradiacao; ver secao 1")
+
+# 8.4 Efeito das decisoes de preparacao sobre a razao de somas
+hc = ch[ch.hora_completa].copy()
+ia = hc.incluir_aderencia
+esp_ghi = hc.energia_esperada_wh * hc.ghi_wh_m2 / hc.poa_wh_m2.where(hc.poa_wh_m2 > 0)
+canal_a = hc.id_equipamento.str.endswith("-A")
+rast = hc.id_equipamento.str.startswith("403000261021")
+sem_trat = (hc.poa_wh_m2 >= 50) & ~hc.canal_sem_geracao_no_dia
+reg("decisoes_preparacao", "razao_modelo_principal", hc.energia_medida_wh[ia].sum() / hc.energia_esperada_wh[ia].sum(), ia.sum(), "Razao de somas nas canal-horas incluidas")
+reg("decisoes_preparacao", "razao_so_canal_a_medido", hc.energia_medida_wh[ia & canal_a].sum() / hc.energia_esperada_wh[ia].sum(), ia.sum(), "Energia medida so do canal A; esperada de todos os modulos")
+reg("decisoes_preparacao", "razao_ghi_no_lugar_da_poa", hc.energia_medida_wh[ia].sum() / esp_ghi[ia].sum(), ia.sum(), "Esperada reescalada por GHI/POA (temperatura de celula mantida)")
+reg("decisoes_preparacao", "razao_rastreador_principal", hc.energia_medida_wh[ia & rast].sum() / hc.energia_esperada_wh[ia & rast].sum(), (ia & rast).sum(), "Canais do rastreador, modelo principal")
+reg("decisoes_preparacao", "razao_rastreador_sem_excluir_travado", hc.energia_medida_wh[sem_trat & rast].sum() / hc.energia_esperada_wh[sem_trat & rast].sum(), (sem_trat & rast).sum(),
+    "Canais do rastreador incluindo os dias travados ou indeterminados (hora completa, POA >= 50, canal gerando)")
+
+# 8.5 Quarentena diurna e noturna (zenite no meio da hora; horas fora da tabela horaria contam como noite)
+qd = spark.sql(f"""SELECT CASE WHEN z.zenite_solar_graus < 90 THEN 'dia' ELSE 'noite' END periodo, count(*) n
+                  FROM fotovoltaica_ifes.silver.usina_geracao_quarentena q
+                  LEFT JOIN {GOLD}.fato_irradiancia_plano_hora z ON date_trunc('hour', q.instante_coleta_local) = z.hora_local
+                  WHERE q.motivo_quarentena = 'equipamento_sem_leitura' GROUP BY 1""").toPandas().set_index("periodo").n
+for p_, n_ in qd.items():
+    reg("quarentena", f"equipamento_sem_leitura_{p_}", n_, n_, "Linhas em quarentena por falta de potencia, por periodo do dia")
+
+# 8.6 Estados do rastreador classificados (sem heranca), por periodo
+er = spark.table(f"{GOLD}.estado_rastreador_dia").toPandas(); er = er[~er.estado_inferido]; er["data"] = pd.to_datetime(er.data)
+def conta(est, ini=None, fim=None):
+    s = er[er.estado == est]
+    if ini: s = s[(s.data >= ini) & (s.data <= fim)]
+    return len(s)
+for est, ini, fim in [("parado_referencia", None, None), ("parado_referencia", "2020-11-01", "2021-02-28"),
+                      ("rastreando", None, None), ("rastreando", "2021-03-01", "2021-08-31"),
+                      ("travado_oeste", None, None), ("travado_oeste", "2021-12-01", "2022-02-28"), ("travado_oeste", "2021-05-01", "2021-07-31"),
+                      ("rastreando", "2021-09-01", "2021-11-30"), ("parado_referencia", "2021-09-01", "2021-11-30"), ("travado_oeste", "2021-09-01", "2021-11-30")]:
+    n_ = conta(est, ini, fim)
+    reg("rastreador", f"{est}_{ini or 'todo'}_{fim or 'periodo'}", n_, n_, "Dias classificados no estado (sem dias herdados)")
+
+# 8.7 Razao de desempenho (IEC 61724-1) nas canal-horas incluidas
+de = spark.table(f"{GOLD}.dim_equipamento").select("id_equipamento", "potencia_nominal_modulo_wp", "coef_temp_potencia_pct_c").toPandas()
+pr = inc.merge(de, on="id_equipamento")
+pr["yr"] = pr.poa_wh_m2 / 1000 * pr.potencia_nominal_modulo_wp
+pr["yr_t"] = pr.yr * (1 + pr.coef_temp_potencia_pct_c / 100 * (pr.temperatura_celula_noct_c - 25))
+for nome, s in [("todas", pr), ("fixa", pr[pr.estrutura == "fixa"]), ("rastreador", pr[pr.estrutura == "rastreador"])]:
+    reg("pr", f"pr_{nome}", s.energia_medida_wh.sum() / s.yr.sum(), len(s), "Energia medida / (H_POA / 1000 x Wp)")
+    reg("pr", f"pr_corrigida_temperatura_{nome}", s.energia_medida_wh.sum() / s.yr_t.sum(), len(s), "PR com Y_r corrigido pela temperatura NOCT")
+
+# 8.8 Atlas (LABREN) x climatologia do NASA POWER, GHI mensal
+cl = spark.table(f"{GOLD}.ref_climatologia_mes").toPandas()
+a = cl[(cl.fonte == "atlas_labren_2017") & (cl.camada == "global_horizontal")].set_index("mes").valor_kwh_m2_dia
+nclim = cl[(cl.fonte == "nasa_power_2001_2020") & (cl.camada == "global_horizontal")].set_index("mes").valor_kwh_m2_dia
+reg("atlas", "dif_mensal_maxima_pct", ((a / nclim - 1).abs() * 100).max(), 12, "Maior diferenca mensal absoluta entre Atlas e climatologia NASA (%)")
+reg("atlas", "dif_media_anual_pct", (a.mean() / nclim.mean() - 1) * 100, 12, "Diferenca entre as medias anuais (%)")
+
+ver = pd.DataFrame(V)
+spark.createDataFrame(ver).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{GOLD}.avaliacao_verificacoes")
+display(ver)
+saida["verificacoes"] = ver.round(4).to_dict("records")
 
 # COMMAND ----------
 
