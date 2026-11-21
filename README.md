@@ -37,7 +37,7 @@ A numeração é a mesma do Apêndice B do TCC. Os sufixos (04b, 05b e 08b) iden
 | `11_avaliacao_funcional_qualidade` | avaliação | Regras de qualidade por camada |
 | `12_avaliacao_desempenho` | avaliação | Armazenamento, leitura e escalabilidade |
 | `13_teste_idempotencia_incremental` | avaliação | Teste de idempotência e de carga incremental num esquema separado |
-| `14_avaliacao_aderencia` | avaliação | Métricas de erro, recortes, sensibilidade e alinhamento temporal |
+| `14_avaliacao_aderencia` | avaliação | Métricas de erro, recortes, sensibilidade, alinhamento temporal e verificações complementares |
 
 Os notebooks 01 a 10 formam o pipeline. Os notebooks 11 a 14 executam a avaliação e gravam os resultados em tabelas `gold.avaliacao_*`.
 
