@@ -148,7 +148,7 @@ def main():
         print("Se for bloqueio de rede, tente em outra rede ou abra o link no navegador:")
         print("https://power.larc.nasa.gov/data-access-viewer/")
         sys.exit(1)
-    print("\nConcluído. Envie os arquivos gerados para o Claude.")
+    print("\nConcluído.")
 
 
 if __name__ == "__main__":
